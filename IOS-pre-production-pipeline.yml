@@ -1,0 +1,199 @@
+# azure-pipeline.yml
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - feature/*
+      - hotfix/*
+  tags:
+    include:
+      - v*
+pool:
+  vmImage: "macos-latest" # Adjust if you use a self-hosted agent
+
+variables:
+  flutterVersion: "3.27.3"
+  xcodeDeveloperDir: "/Applications/Xcode.app/Contents/Developer"
+  xcodeVersion: "default" # Set to Xcode  explicitly
+  versionName: "1.0.2"
+  buildNumber: $[counter('versioncounter', 1)]
+  # Replace with the exact name of your provisioning profile from Apple Developer
+  PROVISIONING_PROFILE_NAME: "Azure Pipeline"
+  CODE_SIGN_IDENTITY: "iPhone Distribution: "
+  BUNDLE_ID: "com.test.test"
+
+stages:
+  - stage: Build
+    jobs:
+      - job: BuildiOS
+        timeoutInMinutes: 120
+        steps:
+          - task: DownloadSecureFile@1
+            name: IOSDistributioncertificates
+            displayName: "Download P12 IOS Distribution Certificate"
+            inputs:
+              secureFile: "AzureIOSDistributionCertificates.p12"
+
+          - task: InstallAppleCertificate@2
+            inputs:
+              certSecureFile: "AzureIOSDistributionCertificates.p12"
+              certPwd: "$(P12_PASSWORD)"
+              keychain: "temp"
+              deleteCert: true
+
+          # Download and install your provisioning profile
+          - task: DownloadSecureFile@1
+            name: provisioningProfile
+            displayName: "Download Provisioning Profile"
+            inputs:
+              secureFile: "Azure_Pipeline.mobileprovision"
+
+          - task: InstallAppleProvisioningProfile@1
+            inputs:
+              provisioningProfileLocation: "secureFiles"
+              provProfileSecureFile: "Azure_Pipeline.mobileprovision"
+              removeProfile: false
+
+          # Install Flutter
+          - task: FlutterInstall@0
+            displayName: "Install Flutter"
+            inputs:
+              mode: "version"
+              version: $(flutterVersion)
+              architecture: "x64"
+              customUrl: "https://storage.googleapis.com/flutter_infra_release/releases/stable/macos/flutter_macos_$(flutterVersion)-stable.zip"
+
+          # Update bundle identifier and set manual signing in project.pbxproj
+          - script: |
+              cd ios
+              sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = .*;/PRODUCT_BUNDLE_IDENTIFIER = $(BUNDLE_ID);/" Runner.xcodeproj/project.pbxproj
+              sed -i '' "s/PROVISIONING_PROFILE_SPECIFIER = .*;/PROVISIONING_PROFILE_SPECIFIER = \"$(PROVISIONING_PROFILE_NAME)\";/" Runner.xcodeproj/project.pbxproj
+              # Disable automatic signing
+              sed -i '' "s/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/" Runner.xcodeproj/project.pbxproj
+              # Set code sign identity
+              sed -i '' "s/CODE_SIGN_IDENTITY = .*;/CODE_SIGN_IDENTITY = \"$(CODE_SIGN_IDENTITY)\";/" Runner.xcodeproj/project.pbxproj
+            displayName: "Update Bundle ID and Manual Signing Settings"
+
+          # Clean the Xcode workspace
+          - task: Xcode@5
+            inputs:
+              actions: "clean"
+              sdk: "iphoneos"
+              xcWorkspacePath: "ios/Runner.xcworkspace"
+              scheme: "Runner"
+              xcodeVersion: "$(xcodeVersion)"
+              packageApp: false
+              signingOption: "auto"
+              teamId: "$(TEAM_ID)"
+
+          - script: flutter --version
+            displayName: "Verify Flutter Version"
+
+          - script: flutter clean
+            displayName: "Flutter Clean"
+
+          # Clone Flutter Hyperpay Plugin repository
+          - script: |
+              git config --global url."https://$(GITHUB_TOKEN)@github.com/".insteadOf "https://github.com/"
+            displayName: "Configure Git to Use GitHub Token for Cloning"
+
+          - script: flutter pub get
+            displayName: "Flutter Pub Get"
+
+          # Setup Hyperpay SDK frameworks
+          - script: |
+              # mkdir -p "/Users/runner/Downloads/iOS_Frameworks_6"
+              # cd "/Users/runner/Downloads/iOS_Frameworks_6"
+              git clone https://github.com/ahmedelkhyary/hyperpay_sdk_zip.git
+              cp -R hyperpay_sdk_zip/OPPWAMobile.xcframework ./OPPWAMobile.xcframework
+              cp -R hyperpay_sdk_zip/ipworks3ds_sdk_deploy_9048.xcframework ./ipworks3ds_sdk_deploy_9048.xcframework 
+              rm -rf hyperpay_sdk_zip
+              # Sign all architectures in the ipworks3ds framework
+              # find ./ipworks3ds_sdk_deploy_9048.xcframework -type f -name "ipworks3ds_sdk" -exec codesign --force --sign "$(CODE_SIGN_IDENTITY)" --preserve-metadata=identifier,entitlements,flags --timestamp=none {} \;
+            displayName: "Setup Hyperpay SDK Frameworks"
+
+          # Modify the Podfile to use the CocoaPods CDN and run pod install
+          - script: |
+              cd ios
+              echo "Switching Podfile source to CocoaPods CDN..."
+              sed -i.bak "s|https://github.com/CocoaPods/Specs.git|https://cdn.cocoapods.org/|g" Podfile
+              pod install
+            displayName: "Pod Install using CocoaPods CDN"
+
+          # Cache the iOS Pods directory
+          - task: Cache@2
+            inputs:
+              key: 'pods-cache-v1 | "$(Agent.OS)" | ios/Podfile.lock'
+              restoreKeys: |
+                pods-cache-v1 | "$(Agent.OS)"
+              path: ios/Pods
+            displayName: "Cache Pods Directory"
+
+          # Update version/build number and build the iOS app
+          - script: |
+              cd ios
+              /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(versionName)" Runner/Info.plist
+              /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(buildNumber)" Runner/Info.plist
+              cd ..
+              flutter build ios --release --no-codesign
+            displayName: "Build iOS"
+
+          # Create exportOptions.plist with manual signing
+          - script: |
+              cat > ios/exportOptions.plist << EOF
+              <?xml version="1.0" encoding="UTF-8"?>
+              <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+              <plist version="1.0">
+              <dict>
+                  <key>method</key>
+                  <string>app-store</string>
+                  <key>teamID</key>
+                  <string>$(TEAM_ID)</string>
+                  <key>signingStyle</key>
+                  <string>manual</string>
+                  <key>provisioningProfiles</key>
+                  <dict>
+                      <key>$(BUNDLE_ID)</key>
+                      <string>$(PROVISIONING_PROFILE_NAME)</string>
+                  </dict>
+                  <key>signingCertificate</key>
+                  <string>$(CODE_SIGN_IDENTITY)</string>
+              </dict>
+              </plist>
+              EOF
+            displayName: "Create exportOptions.plist"
+
+          # Archive the app with manual signing
+          - script: |
+              cd ios
+              xcodebuild -workspace Runner.xcworkspace \
+                -scheme Runner \
+                -sdk iphoneos \
+                -configuration Release \
+                -archivePath "$(Build.SourcesDirectory)/build/Runner.xcarchive" \
+                CODE_SIGN_STYLE="Manual" \
+                PROVISIONING_PROFILE_SPECIFIER="$(PROVISIONING_PROFILE_NAME)" \
+                CODE_SIGN_IDENTITY="$(CODE_SIGN_IDENTITY)" \
+                archive
+            displayName: "Create Archive with Manual Signing"
+
+          # Export the IPA from the archive
+          - script: |
+              cd ios
+              xcodebuild -exportArchive \
+                -archivePath "$(Build.SourcesDirectory)/build/Runner.xcarchive" \
+                -exportOptionsPlist exportOptions.plist \
+                -exportPath "$(Build.SourcesDirectory)/build/ios/ipa"
+            displayName: "Export IPA"
+
+          # Publish the IPA to TestFlight
+          - script: |
+              xcrun altool --upload-app \
+                --type ios \
+                --file "build/ios/ipa/Runner.ipa" \
+                --username "$(APPLE_ID)" \
+                --password "$(APPLE_APP_SPECIFIC_PASSWORD)" \
+                --bundle-id "$(BUNDLE_ID)"
+            displayName: "Publish to TestFlight"

@@ -1,5 +1,5 @@
 # IOS Pre Production Pipeline
-IOS pipeline for CI process to upload your application to testflight 
+This pipeline automates the Continuous Integration (CI) process for building and deploying iOS application to TestFlight using Azure DevOps.
 
 # Build and Deployment Requirements
 
